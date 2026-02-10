@@ -277,8 +277,7 @@ RFmerge.zoo <- function(x, metadata, cov, mask, training,
              pckgFn <- function(packages) {
                for(i in packages) library(i, character.only = TRUE)
              } # 'packFn' END
-             parallel::clusterCall(cl, pckgFn, par.pkgs)
-             parallel::clusterExport(cl, utils::ls.str(mode="function",envir=.GlobalEnv) )
+             parallel::clusterCall(cl, pckgFn, unique(c(par.pkgs, "terra", "randomForest", "zoo")))
            } # ELSE end                   
            
        } # ELSE end  
@@ -293,6 +292,32 @@ RFmerge.zoo <- function(x, metadata, cov, mask, training,
   ntsteps <- terra::nlyr(cov[[1]])
   ldates  <- zoo::index(x)
   
+  if (parallel=="parallelWin") {
+    if (verbose) message("[ Preparing PSOCK inputs for parallelWin ... ]")
+
+    psock.drty <- tempfile(pattern="RFmerge_parallelWin_")
+    dir.create(psock.drty, recursive=TRUE)
+
+    cov.files <- sapply(1:length(cov), FUN=function(i) {
+      fname <- file.path(psock.drty, paste0("cov_", i, ".tif"))
+      terra::writeRaster(cov[[i]], fname, overwrite=TRUE)
+      fname
+    })
+
+    lsample.file <- file.path(psock.drty, "lsample.tif")
+    terra::writeRaster(lsample, lsample.file, overwrite=TRUE)
+
+    if (ED) {
+      buff.dist.file <- file.path(psock.drty, "buff_dist.tif")
+      terra::writeRaster(buff.dist, buff.dist.file, overwrite=TRUE)
+    } else buff.dist.file <- NA_character_
+
+    if (!missing(mask)) {
+      mask.file <- file.path(psock.drty, "mask.gpkg")
+      terra::writeVector(mask, mask.file, overwrite=TRUE)
+    } else mask.file <- NA_character_
+  }
+
   if (use.pb) pbapply::pboptions(char = "=")
 
   # Evaluating an R Function 
@@ -301,12 +326,20 @@ RFmerge.zoo <- function(x, metadata, cov, mask, training,
       out <- pbapply::pbsapply(X=1:ntsteps, FUN=.lrf, ldates, metadata, id, points, cov, mask, merged.drty, na.action, ntree, ED, train.ts, train.metadata, buff.dist, lsample, write2disk)
     } else out <- sapply(X=1:ntsteps, FUN=.lrf, ldates, metadata, id, points, cov, mask, merged.drty, na.action, ntree, ED, train.ts, train.metadata, buff.dist, lsample, write2disk)
     out <- terra::rast(out)
-  } else {
+  } else if (parallel=="parallel") {
       if (use.pb) {
         out <- pbapply::pbsapply(X=1:ntsteps, FUN=.lrf, ldates, metadata, id, points, cov, mask, merged.drty, na.action, ntree, ED, train.ts, train.metadata, buff.dist, lsample, write2disk, cl=cl, ...)
       } else  out <- parallel::clusterApply(cl= cl, 1:ntsteps, fun=.lrf, ldates, metadata, id, points, cov, mask, merged.drty, na.action, ntree, ED, train.ts, train.metadata, buff.dist, lsample, write2disk, ...)
       out <- terra::rast(out)
       parallel::stopCluster(cl)
+      if (verbose) message("[ Parallelisation finished ! ]")
+  } else if (parallel=="parallelWin") {
+      if (use.pb) {
+        out <- pbapply::pbsapply(X=1:ntsteps, FUN=.lrf_psock, ldates=ldates, metadata=metadata, id=id, train.metadata=train.metadata, train.ts=train.ts, cov.files=cov.files, mask.file=mask.file, merged.drty=merged.drty, na.action=na.action, ntree=ntree, ED=ED, buff.dist.file=buff.dist.file, lsample.file=lsample.file, write2disk=write2disk, lon=lon, lat=lat, cl=cl, ...)
+      } else out <- parallel::clusterApply(cl=cl, x=1:ntsteps, fun=.lrf_psock, ldates=ldates, metadata=metadata, id=id, train.metadata=train.metadata, train.ts=train.ts, cov.files=cov.files, mask.file=mask.file, merged.drty=merged.drty, na.action=na.action, ntree=ntree, ED=ED, buff.dist.file=buff.dist.file, lsample.file=lsample.file, write2disk=write2disk, lon=lon, lat=lat, ...)
+      out <- terra::rast(out)
+      parallel::stopCluster(cl)
+      unlink(psock.drty, recursive=TRUE, force=TRUE)
       if (verbose) message("[ Parallelisation finished ! ]")
    } # ELSE end    
     
@@ -406,5 +439,65 @@ RFmerge.zoo <- function(x, metadata, cov, mask, training,
 
   } # '.lrf' END
 
+
+.lrf_psock <- function(day, ldates, metadata, id, train.metadata, train.ts, cov.files, mask.file, merged.drty, na.action, ntree, ED, buff.dist.file, lsample.file, write2disk, lon, lat, ...) {
+
+    lsample <- terra::rast(lsample.file)
+
+    points  <- train.metadata
+    points  <- terra::vect(points, geom=c(lon, lat))
+    terra::crs(points) <- terra::crs(lsample)
+
+    ncovs   <- length(cov.files)
+    cov.day <- vector("list", ncovs)
+    for(i in 1:ncovs)
+      cov.day[[i]] <- terra::rast(cov.files[i])[[day]]
+
+    cov.day <- terra::rast(cov.day)
+
+    if (ED) {
+      buff.dist <- terra::rast(buff.dist.file)
+      cov.day <- c(cov.day, buff.dist)
+    }
+
+    nr         <- nrow(train.metadata)
+    codes      <- vector("numeric", length= nr)
+    obs.values <- codes
+
+    for ( i in 1:nr ) {
+      metadata      <- train.metadata[i,]
+      codes[i]      <- as.character(metadata[,id])
+      obs.values[i] <- train.ts[day, grep(metadata[,id], names(train.ts))]
+    } # FOR end
+
+    extraction     <- data.frame(terra::extract(cov.day, points, ID=FALSE))
+    names(cov.day) <- names(extraction)
+
+    table     <- data.frame(codes, obs.values, extraction)
+    table.cov <- table[,2:ncol(table)]
+
+    result <- lsample * 0
+
+    if ( sum(table$obs.values, na.rm = TRUE) > 0) {
+      suppressWarnings(
+        rf.model <- randomForest::randomForest(obs.values ~ ., data = table.cov, na.action = na.action, ntree = ntree, ... )
+      )
+      result   <- terra::predict(cov.day, rf.model)
+    }
+
+    if (!is.na(mask.file)) {
+      mask <- terra::vect(mask.file)
+      result <- terra::mask(result, mask)
+    }
+
+    if ( write2disk ) {
+      ldate <- paste0("RF-MEP_", ldates[day], ".tif") 
+      fname <- file.path(merged.drty, ldate)
+      terra::writeRaster(result, fname, overwrite = TRUE)
+    } # IF end
+
+    return(result)
+
+  } # '.lrf_psock' END
 
 
