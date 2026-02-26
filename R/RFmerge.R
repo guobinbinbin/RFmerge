@@ -172,7 +172,9 @@ RFmerge.zoo <- function(x, metadata, cov, mask, training,
     terra::rast( replicate( max(cov.layers), cov[[index]] ) )
   }
   
-  cov[index] <- sapply(index, set.covariates, cov=cov, cov.layers=cov.layers)
+  if (length(index) > 0) {
+    cov[index] <- lapply(index, set.covariates, cov=cov, cov.layers=cov.layers)
+  }
 
   lsample <- cov[[1]][[1]]
   
@@ -221,7 +223,6 @@ RFmerge.zoo <- function(x, metadata, cov, mask, training,
   if (ED) {
     if (verbose) message("[ Computing the Euclidean distances to each observation of the training set ...]")
   
-    terra::rast( replicate( max(cov.layers), cov[[index]] ) )
     buff.dist <- vector("list", npoints)
     for(i in 1:npoints)
       buff.dist[[i]] <- terra::distance(lsample, points[i], rasterize=FALSE)
